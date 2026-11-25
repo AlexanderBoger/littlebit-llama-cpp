@@ -1,0 +1,139 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 4b7e786..7d2f804 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -239,6 +239,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_SWIGLU_CLAMP_SHEXP,                "%s.swiglu_clamp_shexp"                },
+     { LLM_KV_SWIGLU_CLAMP,                      "%s.swiglu_clamp"                      },
+     { LLM_KV_USE_PARALLEL_RESIDUAL,             "%s.use_parallel_residual"             },
++    { LLM_KV_LITTLEBIT_VERSION,                 "littlebit.version"                     },
++    { LLM_KV_LITTLEBIT_RESIDUAL,                "littlebit.residual"                    },
+     { LLM_KV_TENSOR_DATA_LAYOUT,                "%s.tensor_data_layout"                },
+     { LLM_KV_EXPERT_COUNT,                      "%s.expert_count"                      },
+     { LLM_KV_EXPERT_USED_COUNT,                 "%s.expert_used_count"                 },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 74ca69f..69aa8e3 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -243,6 +243,8 @@ enum llm_kv {
+     LLM_KV_SWIGLU_CLAMP_SHEXP,
+     LLM_KV_SWIGLU_CLAMP,
+     LLM_KV_USE_PARALLEL_RESIDUAL,
++    LLM_KV_LITTLEBIT_VERSION,
++    LLM_KV_LITTLEBIT_RESIDUAL,
+     LLM_KV_TENSOR_DATA_LAYOUT,
+     LLM_KV_EXPERT_COUNT,
+     LLM_KV_EXPERT_USED_COUNT,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5fef4c4..3685245 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1844,6 +1844,25 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
++    if (model.littlebit_version) {
++        const auto it = model.littlebit_projections.find(w);
++        if (it != model.littlebit_projections.end()) {
++            if (!loras->empty()) {
++                throw std::runtime_error("LoRA adapters are unsupported for LittleBit projections");
++            }
++            ggml_tensor * sum = nullptr;
++            for (const auto & branch : it->second) {
++                auto * x = ggml_mul(ctx0, cur, branch.input_scale);
++                auto * h = ggml_mul_mat(ctx0, branch.v, x);
++                h = ggml_mul(ctx0, h, branch.latent_scale);
++                auto * y = ggml_mul_mat(ctx0, branch.u, h);
++                y = ggml_mul(ctx0, y, branch.output_scale);
++                sum = sum ? ggml_add(ctx0, sum, y) : y;
++            }
++            return sum;
++        }
++    }
++
+     if (!w_s) {
+         w_s = model.get_w_scale(w);
+     }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b204596..d32d797 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -4257,6 +4257,37 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+ 
+ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     GGML_ASSERT(ml != nullptr);
++    // In a LittleBit Qwen3 block, each required projection is stored as factors.
++    if (littlebit_version && tn.bid >= 0 && flags == 0 && ne.size() == 2 && std::string(tn.suffix) == "weight") {
++        const int64_t inputs = *ne.begin();
++        const int64_t outputs = *(ne.begin() + 1);
++        std::vector<littlebit_branch> branches;
++        for (int i = 0; i < (littlebit_residual ? 2 : 1); ++i) {
++            const std::string prefix = i ? "lb_r_" : "lb_";
++            auto name = [&](const char * field) { return prefix + field; };
++            auto field = [&](const char * key, std::initializer_list<int64_t> dims, ggml_type type) {
++                const auto suffix = name(key);
++                LLM_TN_IMPL n(tn.arch, tn.tensor, suffix.c_str(), tn.bid, tn.xid);
++                if (ml->require_tensor_meta(n.str())->type != type) {
++                    throw std::runtime_error("unexpected LittleBit tensor type: " + n.str());
++                }
++                return create_tensor(*ml, n, dims, 0);
++            };
++            const auto v_name = name("v");
++            LLM_TN_IMPL v(tn.arch, tn.tensor, v_name.c_str(), tn.bid, tn.xid);
++            const int64_t rank = ml->require_tensor_meta(v.str())->ne[1];
++            branches.push_back({
++                field("v", {inputs, rank}, GGML_TYPE_Q1_0),
++                field("u", {rank, outputs}, GGML_TYPE_Q1_0),
++                field("in", {inputs}, GGML_TYPE_F32),
++                field("mid", {rank}, GGML_TYPE_F32),
++                field("out", {outputs}, GGML_TYPE_F32),
++            });
++        }
++        auto * primary = branches.front().v;
++        littlebit_projections.emplace(primary, std::move(branches));
++        return primary;
++    }
+     return create_tensor(*ml, tn, ne, flags);
+ }
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index e0273d7..a6d7dd6 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -841,6 +841,18 @@ struct llama_model {
+ 
+     llama_hadamard hdmd;
+ 
++    struct littlebit_branch {
++        ggml_tensor * v;
++        ggml_tensor * u;
++        ggml_tensor * input_scale;
++        ggml_tensor * latent_scale;
++        ggml_tensor * output_scale;
++    };
++
++    bool littlebit_residual = false;
++    uint32_t littlebit_version = 0;
++    std::unordered_map<const ggml_tensor *, std::vector<littlebit_branch>> littlebit_projections;
++
+     // weight -> "<name>.scale" tensor (e.g. NVFP4 scale2), applied by build_lora_mm and build_lora_mm_id
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> w_scales;
+ 
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index 7a60529..c0a8de5 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -3,6 +3,13 @@
+ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+ 
++    if (ml.get_key(LLM_KV_LITTLEBIT_VERSION, littlebit_version, false)) {
++        if (littlebit_version != 1) {
++            throw std::runtime_error("unsupported LittleBit GGUF version");
++        }
++        ml.get_key(LLM_KV_LITTLEBIT_RESIDUAL, littlebit_residual);
++    }
++
+     switch (hparams.n_layer()) {
+         case 28: type = hparams.n_embd == 1024 ? LLM_TYPE_0_6B : LLM_TYPE_1_7B; break;
+         case 36: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_8B; break;

@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!Modelfile
+!LICENSE
+!patches/
+!patches/llama.cpp.patch
+!patches/llama.cpp-LICENSE
+!notices/
+!notices/ollama-LICENSE
+!scripts/
+!scripts/build.sh
